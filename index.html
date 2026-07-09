@@ -66,6 +66,10 @@
   .stop .addr{ font-size:12.8px; line-height:1.4; }
   .stop .addr .name{ font-weight:600; }
   .stop .addr .dist{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--muted); margin-top:2px; }
+  .stop-del{ width:auto; flex-shrink:0; padding:4px 9px; font-size:13px; border-radius:6px; background:transparent; border:1px solid var(--line); color:var(--err); align-self:center; }
+  .stop-del:hover{ background:rgba(224,96,92,.15); border-color:var(--err); }
+  .qty-badge{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--accent); font-weight:600; }
+  .warn-badge{ color:var(--err); cursor:help; }
   .tabs{ display:flex; gap:6px; padding:0 22px 14px; }
   .tab{ flex:1; text-align:center; padding:9px 6px; border-radius:7px; cursor:pointer; background:var(--surface-2); border:1px solid var(--line); font-size:12px; font-weight:600; font-family:'Space Grotesk',sans-serif; }
   .tab.active.manana{ background:var(--accent); color:#1a1206; border-color:var(--accent); }
@@ -111,7 +115,7 @@
 
     <div class="section">
       <h2>1 &middot; Móvil / reparto</h2>
-      <label class="small">Nombre del móvil o repartidor</label>
+      <label class="small">Nombre del móvil o repartidor *</label>
       <input type="text" id="vehicleName" placeholder="Ej: Móvil 1 - Juan">
     </div>
 
@@ -147,8 +151,9 @@
       <h2>4 &middot; Pedido imprevisto (carga manual)</h2>
       <label class="small">Dirección</label>
       <input type="text" id="manAddr" placeholder="Ej: Bvar. Artigas 1234">
-      <label class="small">Nombre / referencia (opcional)</label>
-      <input type="text" id="manName" placeholder="Cliente">
+      <label class="small">Nombre / referencia (opcional, ej: DIF FARMACEUTICA)</label>
+      <input type="text" id="manName" placeholder="Cliente o empresa">
+      <div class="sub" style="margin:-4px 0 8px;">Si la dirección no se encuentra, probamos ubicar por este nombre (útil si es una empresa/local ya cargado en el mapa).</div>
       <label class="small">Turno</label>
       <select id="manTurno">
         <option value="">Sin turno</option>
@@ -157,6 +162,16 @@
       </select>
       <button class="btn-ghost" id="manAddBtn" style="margin-top:12px;">Agregar pedido</button>
       <div id="manStatus" class="status"></div>
+    </div>
+
+    <div class="section">
+      <h2>Buscador de calles</h2>
+      <div class="sub" style="margin-bottom:10px;">Solo busca y muestra en el mapa — no agrega ningún pedido salvo que vos lo confirmes. También podés buscar por nombre de empresa (ej: "DIF FARMACEUTICA") en vez de dirección.</div>
+      <label class="small">Dirección, calle o nombre de empresa</label>
+      <input type="text" id="streetSearchInput" placeholder="Ej: Camino Melilla 1234, o DIF FARMACEUTICA">
+      <button class="btn-ghost" id="streetSearchBtn" style="margin-top:10px;">Buscar</button>
+      <div id="streetSearchStatus" class="status"></div>
+      <div id="streetSearchResults"></div>
     </div>
 
     <div class="section" id="geocodeSection" style="display:none;">
@@ -212,6 +227,7 @@ const HIST_KEY = 'rutaOptimaHistorial';
 let rows = [], headers = [];
 let points = [];
 let startPoint = null, endPoint = null;
+let startResolvedFor = null, endResolvedFor = null;
 let map, layers = { manana: [], tarde: [], review: [] };
 let pickingId = null;
 let activeTab = 'manana';
@@ -223,6 +239,7 @@ const el = id => document.getElementById(id);
 const dropzone = el('dropzone'), dropzoneMain = el('dropzoneMain'), fileInput = el('fileInput'), fileStatus = el('fileStatus');
 const columnPicker = el('columnPicker'), addrColSel = el('addrCol'), nameColSel = el('nameCol'), turnoColSel = el('turnoCol');
 const startAddrInput = el('startAddr'), endAddrInput = el('endAddr'), vehicleNameInput = el('vehicleName');
+vehicleNameInput.addEventListener('input', () => { vehicleNameInput.style.borderColor = ''; });
 const manAddr = el('manAddr'), manName = el('manName'), manTurno = el('manTurno'), manAddBtn = el('manAddBtn'), manStatus = el('manStatus');
 const geocodeSection = el('geocodeSection'), geocodeBtn = el('geocodeBtn'), geocodeStatus = el('geocodeStatus');
 const progressTrack = el('progressTrack'), progressFill = el('progressFill');
@@ -233,7 +250,47 @@ const historyList = el('historyList');
 const tabsEl = el('tabs'), stopsList = el('stopsList');
 const emptyMap = el('emptyMap'), pickingBanner = el('pickingBanner'), mapTools = el('mapTools'), printBtn = el('printBtn');
 
+function isDistricompAddress(addr){
+  if (!addr) return false;
+  const a = addr.toLowerCase();
+  return a.includes('magallanes') && a.includes('1688');
+}
+function labelFor(addr, fallback){ return isDistricompAddress(addr) ? 'DISTRICOMP' : fallback; }
+
+// Un mismo cliente puede tener varios pedidos a la misma dirección: los agrupamos en
+// un solo punto de mapa/parada, mostrando la cantidad y avisando si alguno tiene otro turno.
+function groupKeyFor(p){ return ((p.name||'').trim().toLowerCase() || '(sin nombre)') + '|' + (p.address||'').trim().toLowerCase(); }
+function buildGroupedStops(pts){
+  const map = new Map();
+  pts.forEach(p => {
+    const key = groupKeyFor(p);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(p);
+  });
+  return Array.from(map.values()).map(list => {
+    const counts = {};
+    list.forEach(p => { const t = p.turno || '__sin_turno__'; counts[t] = (counts[t]||0) + 1; });
+    let majority = list[0].turno || null, max = -1;
+    Object.keys(counts).forEach(k => { if (counts[k] > max){ max = counts[k]; majority = (k === '__sin_turno__') ? null : k; } });
+    const mismatched = list.filter(p => (p.turno || null) !== majority);
+    return {
+      ...list[0],
+      turno: majority,
+      groupKey: groupKeyFor(list[0]),
+      count: list.length,
+      groupPoints: list,
+      hasTurnoMismatch: mismatched.length > 0,
+      mismatchTurnos: [...new Set(mismatched.map(p => p.turno === 'manana' ? 'Mañana' : p.turno === 'tarde' ? 'Tarde' : 'sin turno'))]
+    };
+  });
+}
+
 // ================= Normalización de direcciones =================
+// Localidades fuera de Montevideo que suelen aparecer en los pedidos (zona metropolitana / Canelones).
+const OUTER_LOCALITIES = ['Ciudad de la Costa','Las Piedras','La Paz','Pando','Barros Blancos','Progreso',
+  'Toledo','Colonia Nicolich','Salinas','Solymar','Lagomar','Shangrilá','Shangrila','El Pinar',
+  'Parque del Plata','Atlántida','Atlantida','Canelones','Sauce','Suárez','Suarez'];
+
 function simplifyAddress(addr){
   let s = ' ' + addr + ' ';
   // apartamentos / departamentos / unidades
@@ -247,16 +304,66 @@ function simplifyAddress(addr){
   return s;
 }
 
-async function geocodeAddressSmart(rawAddr){
-  const simplified = simplifyAddress(rawAddr);
-  let hit = await geocodeQuery(simplified + ', Montevideo, Uruguay', 1);
-  if (!hit.length && simplified.toLowerCase() !== rawAddr.trim().toLowerCase()){
-    await sleep(1000);
-    hit = await geocodeQuery(rawAddr + ', Montevideo, Uruguay', 1);
+// El sistema exporta direcciones tipo "Calle Numero, cruce - Barrio - Ciudad - AptoIdentificador ...".
+// Separamos la calle (primer tramo) de la localidad real, para no forzar "Montevideo" en direcciones
+// que en realidad son de Las Piedras, La Paz, Ciudad de la Costa, etc.
+function parseAddressParts(raw){
+  const segments = raw.split(/\s-\s/).map(s => s.trim()).filter(Boolean);
+  let streetPart = (segments[0] || raw).split(',')[0].trim();
+  const rest = segments.slice(1).join(' ').toLowerCase();
+  let locality = null;
+  for (const loc of OUTER_LOCALITIES){ if (rest.includes(loc.toLowerCase())) { locality = loc; break; } }
+  if (!locality && rest.includes('montevideo')) locality = 'Montevideo';
+  return { streetPart, locality: locality || 'Montevideo' };
+}
+
+// Cajas geográficas aproximadas por departamento, para acotar la búsqueda y evitar que
+// matchee con una calle del mismo nombre en otra parte del país (ej. Tacuarembó).
+const DEPARTMENT_BBOX = {
+  'Montevideo': '-56.35,-34.70,-56.00,-34.95',
+  'Canelones': '-56.60,-34.55,-55.55,-35.05'
+};
+
+async function geocodeAddressSmart(rawAddr, companyName){
+  const { streetPart, locality } = parseAddressParts(rawAddr);
+  const simplifiedStreet = simplifyAddress(streetPart);
+  const isOuter = locality !== 'Montevideo';
+  const deptName = isOuter ? 'Canelones' : 'Montevideo';
+  const bbox = DEPARTMENT_BBOX[deptName];
+  const cityQualifier = isOuter ? (locality + ', Canelones, Uruguay') : 'Montevideo, Uruguay';
+  const name = (companyName || '').trim();
+
+  const attempts = [
+    () => geocodeQueryStructuredBounded(simplifiedStreet, isOuter ? locality : 'Montevideo', bbox, 1),
+    () => geocodeQueryBounded(simplifiedStreet + ', ' + cityQualifier, bbox, 1),
+    () => geocodeQueryBounded(streetPart + ', ' + cityQualifier, bbox, 1),
+    () => geocodeQueryStructured(simplifiedStreet, isOuter ? locality : 'Montevideo', 1),
+    // calle sin número, acotada al departamento correcto (para calles rurales largas)
+    () => geocodeQueryBounded(simplifiedStreet.replace(/\s*\d+\s*$/, '') + ', ' + cityQualifier, bbox, 1)
+  ];
+  // Si hay nombre de empresa/cliente, lo probamos como POI: útil cuando la dirección
+  // está mal escrita pero el local figura cargado en el mapa por su nombre.
+  if (name){
+    attempts.push(() => geocodeQueryBounded(name + ', ' + cityQualifier, bbox, 1));
+    attempts.push(() => geocodeQueryNoCountryFilter(name + ', Uruguay', 1));
   }
-  if (hit.length) return { ok: true, lat: parseFloat(hit[0].lat), lon: parseFloat(hit[0].lon) };
-  await sleep(1000);
-  const sugg = await geocodeQuery(simplified || rawAddr, 5);
+  for (const attempt of attempts){
+    try{
+      const hit = await attempt();
+      if (hit && hit.length) return { ok: true, lat: parseFloat(hit[0].lat), lon: parseFloat(hit[0].lon) };
+    }catch(e){ /* probamos la siguiente variante */ }
+    await sleep(1100);
+  }
+  // Sugerencias: primero acotadas al departamento correcto; recién si ahí no hay nada,
+  // ampliamos a todo el país (pero siempre para que el encargado elija a mano, nunca se acepta solo).
+  let sugg = [];
+  try{ sugg = await geocodeQueryBounded(simplifiedStreet, bbox, 5); }catch(e){ /* sin sugerencias */ }
+  if (!sugg.length && name){
+    try{ sugg = await geocodeQueryNoCountryFilter(name + ', Uruguay', 5); }catch(e){ /* sin sugerencias */ }
+  }
+  if (!sugg.length){
+    try{ sugg = await geocodeQueryNoCountryFilter(simplifiedStreet + ' Uruguay', 5); }catch(e){ /* sin sugerencias */ }
+  }
   return { ok: false, suggestions: sugg.map(s => ({ lat: parseFloat(s.lat), lon: parseFloat(s.lon), display: s.display_name })) };
 }
 
@@ -287,6 +394,7 @@ async function viewHistoryEntry(id){
   startAddrInput.value = entry.startAddr || startAddrInput.value;
   endAddrInput.value = entry.endAddr || '';
   startPoint = entry.startPoint; endPoint = entry.endPoint || null;
+  startResolvedFor = entry.startAddr || null; endResolvedFor = entry.endAddr || null;
   activeTab = Object.keys(results)[0];
   await createMapIfNeeded();
   downloadRow.style.display = 'flex'; calcSection.style.display = 'block';
@@ -309,6 +417,7 @@ async function modifyHistoryEntry(id){
   geocodeSection.style.display = 'block'; reviewSection.style.display = 'block';
   await createMapIfNeeded();
   startPoint = entry.startPoint; endPoint = entry.endPoint || null;
+  startResolvedFor = entry.startAddr || null; endResolvedFor = entry.endAddr || null;
   drawEndpointMarkers();
   renderReview(); drawReviewMarkers();
   confirmBox.innerHTML = ''; downloadRow.style.display = 'none'; saveHistBtn.style.display = 'none';
@@ -380,7 +489,7 @@ manAddBtn.addEventListener('click', async () => {
   hasTurnoSplit = hasTurnoSplit || !!manTurno.value;
   const p = { id:'p'+(uidCounter++), address:addr, name:manName.value.trim(), turnoRaw:'', turno:manTurno.value||null, lat:null, lon:null, status:'pending', suggestions:[], raw:{}, manual:true };
   try{
-    const g = await geocodeAddressSmart(addr);
+    const g = await geocodeAddressSmart(addr, manName.value.trim());
     if (g.ok){ p.lat = g.lat; p.lon = g.lon; p.status = 'ok'; }
     else { p.status = 'failed'; p.suggestions = g.suggestions; }
   }catch(e){ p.status = 'failed'; }
@@ -393,9 +502,108 @@ manAddBtn.addEventListener('click', async () => {
   await createMapIfNeeded(); renderReview(); drawReviewMarkers();
 });
 
+// ================= Buscador de calles (no agrega pedidos por sí solo) =================
+const streetSearchInput = el('streetSearchInput'), streetSearchBtn = el('streetSearchBtn'),
+      streetSearchStatus = el('streetSearchStatus'), streetSearchResultsEl = el('streetSearchResults');
+let streetSearchMarkers = [], streetSearchHits = [];
+
+streetSearchBtn.addEventListener('click', runStreetSearch);
+streetSearchInput.addEventListener('keydown', e => { if (e.key === 'Enter') runStreetSearch(); });
+
+async function runStreetSearch(){
+  const q = streetSearchInput.value.trim();
+  if (!q){ streetSearchStatus.className='status err'; streetSearchStatus.textContent='Escribí algo para buscar.'; return; }
+  streetSearchBtn.disabled = true;
+  streetSearchStatus.className = 'status'; streetSearchStatus.textContent = 'Buscando...';
+  streetSearchResultsEl.innerHTML = '';
+  await createMapIfNeeded();
+  try{
+    let hits = await geocodeQuery(q + ', Montevideo, Uruguay', 5);
+    if (!hits.length) hits = await geocodeQuery(q + ', Canelones, Uruguay', 5);
+    if (!hits.length) hits = await geocodeQueryNoCountryFilter(q + ', Uruguay', 5);
+    if (!hits.length){
+      streetSearchStatus.className = 'status warn'; streetSearchStatus.textContent = 'No se encontraron resultados para esa búsqueda.';
+    } else {
+      streetSearchStatus.className = 'status ok'; streetSearchStatus.textContent = hits.length + ' resultado(s) encontrado(s).';
+      renderStreetSearchResults(hits);
+    }
+  }catch(e){
+    streetSearchStatus.className = 'status err'; streetSearchStatus.textContent = 'Error al buscar: ' + e.message;
+  }finally{ streetSearchBtn.disabled = false; }
+}
+
+function renderStreetSearchResults(hits){
+  streetSearchHits = hits;
+  streetSearchResultsEl.innerHTML = '';
+  streetSearchMarkers.forEach(m => map.removeLayer(m)); streetSearchMarkers = [];
+  hits.forEach((h, idx) => {
+    const lat = parseFloat(h.lat), lon = parseFloat(h.lon);
+    const div = document.createElement('div'); div.className = 'review-item';
+    const turnoSelect = hasTurnoSplit ? `<select id="ssTurno${idx}" style="margin-top:6px;"><option value="manana">Mañana (9-13)</option><option value="tarde">Tarde (14-18)</option></select>` : '';
+    div.innerHTML = `<div class="head">${h.display_name}</div>
+      <div class="row-btns"><button class="btn-mini" onclick="focusSearchResult(${idx})">Ver en el mapa</button><button class="btn-mini" onclick="toggleAddForm(${idx})">Agregar a la ruta</button></div>
+      <div id="ssForm${idx}" style="display:none;margin-top:8px;">
+        <input type="text" id="ssName${idx}" class="field-input" placeholder="Nombre / referencia (opcional)" style="margin-bottom:6px;">
+        ${turnoSelect}
+        <button class="btn-primary" style="margin-top:8px;" onclick="confirmAddSearchResult(${idx})">Confirmar y agregar a la ruta</button>
+      </div>`;
+    streetSearchResultsEl.appendChild(div);
+    const icon = pinIcon('#5ab0ff','#0c2032','?',false);
+    const m = L.marker([lat, lon], { icon }).addTo(map).bindPopup(h.display_name);
+    streetSearchMarkers.push(m);
+  });
+}
+function focusSearchResult(idx){
+  const h = streetSearchHits[idx];
+  map.setView([parseFloat(h.lat), parseFloat(h.lon)], 17);
+  streetSearchMarkers[idx].openPopup();
+}
+function toggleAddForm(idx){
+  const form = el('ssForm' + idx);
+  form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+function confirmAddSearchResult(idx){
+  const h = streetSearchHits[idx];
+  const name = (el('ssName' + idx) || {}).value || '';
+  const turno = hasTurnoSplit ? (el('ssTurno' + idx) || {}).value : null;
+  const p = { id:'p'+(uidCounter++), address: h.display_name, name: name.trim(), turnoRaw:'', turno: turno || null,
+    lat: parseFloat(h.lat), lon: parseFloat(h.lon), status: 'ok', suggestions: [], raw: {}, manual: true };
+  points.push(p);
+  geocodeSection.style.display = 'block'; reviewSection.style.display = 'block';
+  streetSearchMarkers.forEach(m => map.removeLayer(m)); streetSearchMarkers = [];
+  streetSearchResultsEl.innerHTML = '';
+  streetSearchStatus.className = 'status ok'; streetSearchStatus.textContent = 'Agregado a la ruta. No olvides recalcular.';
+  streetSearchInput.value = '';
+  renderReview(); drawReviewMarkers();
+}
+
 // ================= Geocoding =================
 async function geocodeQuery(q, limit){
   const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&countrycodes=uy&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url, { headers: { 'Accept-Language': 'es' } });
+  if (!res.ok) throw new Error('geocode failed');
+  return res.json();
+}
+async function geocodeQueryNoCountryFilter(q, limit){
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url, { headers: { 'Accept-Language': 'es' } });
+  if (!res.ok) throw new Error('geocode failed');
+  return res.json();
+}
+async function geocodeQueryStructured(streetAddr, city, limit){
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&street=${encodeURIComponent(streetAddr)}&city=${encodeURIComponent(city || 'Montevideo')}&country=Uruguay`;
+  const res = await fetch(url, { headers: { 'Accept-Language': 'es' } });
+  if (!res.ok) throw new Error('geocode failed');
+  return res.json();
+}
+async function geocodeQueryBounded(q, bbox, limit){
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&countrycodes=uy&viewbox=${bbox}&bounded=1&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url, { headers: { 'Accept-Language': 'es' } });
+  if (!res.ok) throw new Error('geocode failed');
+  return res.json();
+}
+async function geocodeQueryStructuredBounded(streetAddr, city, bbox, limit){
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&street=${encodeURIComponent(streetAddr)}&city=${encodeURIComponent(city || 'Montevideo')}&country=Uruguay&viewbox=${bbox}&bounded=1`;
   const res = await fetch(url, { headers: { 'Accept-Language': 'es' } });
   if (!res.ok) throw new Error('geocode failed');
   return res.json();
@@ -416,19 +624,30 @@ async function geocodeOne(address){
 
 geocodeBtn.addEventListener('click', runGeocode);
 async function runGeocode(){
+  if (!vehicleNameInput.value.trim()){
+    vehicleNameInput.focus();
+    vehicleNameInput.style.borderColor = 'var(--err)';
+    geocodeStatus.className = 'status err';
+    geocodeStatus.textContent = 'Ingresá el nombre del móvil / repartidor antes de continuar.';
+    return;
+  }
+  vehicleNameInput.style.borderColor = '';
   geocodeBtn.disabled = true;
   progressTrack.style.display = 'block'; progressFill.style.width = '0%';
   geocodeStatus.className = 'status';
   hasTurnoSplit = hasTurnoSplit || !!turnoColSel.value;
+  let startFailed = false, endFailed = false;
   try{
     geocodeStatus.textContent = 'Ubicando el punto de salida...';
-    startPoint = await geocodeOne(startAddrInput.value.trim());
+    try{ startPoint = await geocodeOne(startAddrInput.value.trim()); startResolvedFor = startAddrInput.value.trim(); }
+    catch(e){ startPoint = null; startFailed = true; startResolvedFor = null; }
     await sleep(1000);
     if (endAddrInput.value.trim()){
       geocodeStatus.textContent = 'Ubicando el punto de llegada...';
-      endPoint = await geocodeOne(endAddrInput.value.trim());
+      try{ endPoint = await geocodeOne(endAddrInput.value.trim()); endResolvedFor = endAddrInput.value.trim(); }
+      catch(e){ endPoint = null; endFailed = true; endResolvedFor = null; }
       await sleep(1000);
-    } else { endPoint = null; }
+    } else { endPoint = null; endResolvedFor = null; }
     await createMapIfNeeded();
     const toGeocode = points.filter(p => p.status === 'pending');
     for (let i = 0; i < toGeocode.length; i++){
@@ -437,23 +656,43 @@ async function runGeocode(){
       geocodeStatus.textContent = `Geocodificando ${i+1}/${toGeocode.length}: ${p.address.slice(0,40) || '(vacía)'}`;
       if (!p.address){ p.status = 'failed'; continue; }
       try{
-        const g = await geocodeAddressSmart(p.address);
+        const g = await geocodeAddressSmart(p.address, p.name);
         if (g.ok){ p.lat = g.lat; p.lon = g.lon; p.status = 'ok'; }
         else { p.status = 'failed'; p.suggestions = g.suggestions; }
       }catch(e){ p.status = 'failed'; }
       await sleep(1000);
     }
-    geocodeStatus.className = 'status ok';
     const ok = points.filter(p => p.status === 'ok').length;
-    geocodeStatus.textContent = `${ok}/${points.length} direcciones ubicadas en total.`;
+    if (startFailed || endFailed){
+      geocodeStatus.className = 'status warn';
+      geocodeStatus.textContent = (startFailed ? 'No se pudo ubicar el punto de salida. ' : '') + (endFailed ? 'No se pudo ubicar el punto de llegada. ' : '') + 'Marcalo en el mapa (botón abajo) o revisá la dirección escrita. Mientras tanto, ' + ok + '/' + points.length + ' pedidos quedaron ubicados.';
+    } else {
+      geocodeStatus.className = 'status ok';
+      geocodeStatus.textContent = `${ok}/${points.length} direcciones ubicadas en total.`;
+    }
     reviewSection.style.display = 'block';
     renderReview(); drawReviewMarkers(); drawEndpointMarkers();
+    renderEndpointIssues(startFailed, endFailed);
   }catch(err){
     geocodeStatus.className = 'status err'; geocodeStatus.textContent = 'Error: ' + err.message;
   }finally{
     geocodeBtn.disabled = false; updateGeocodeButtonLabel();
     setTimeout(() => progressTrack.style.display = 'none', 600);
   }
+}
+
+function renderEndpointIssues(startFailed, endFailed){
+  let box = el('endpointIssues');
+  if (!box){
+    box = document.createElement('div');
+    box.id = 'endpointIssues';
+    geocodeSection.appendChild(box);
+  }
+  if (!startFailed && !endFailed){ box.innerHTML = ''; return; }
+  let html = '';
+  if (startFailed) html += '<div class="review-item"><div class="tag err">Sin ubicar</div><div class="head">Punto de salida</div><div class="orig">' + startAddrInput.value.trim() + '</div><div class="row-btns"><button class="btn-mini" onclick="startPicking(\'__start__\')">Elegir en el mapa</button></div></div>';
+  if (endFailed) html += '<div class="review-item"><div class="tag err">Sin ubicar</div><div class="head">Punto de llegada</div><div class="orig">' + endAddrInput.value.trim() + '</div><div class="row-btns"><button class="btn-mini" onclick="startPicking(\'__end__\')">Elegir en el mapa</button></div></div>';
+  box.innerHTML = html;
 }
 
 // ================= Revisión =================
@@ -491,6 +730,12 @@ function startPicking(id){ pickingId = id; pickingBanner.style.display = 'block'
 pickingBanner.addEventListener('click', () => { pickingId = null; pickingBanner.style.display = 'none'; });
 function reubicarDesdeMapa(id){ startPicking(id); }
 function eliminarDesdeMapa(id){ points = points.filter(x => x.id !== id); renderReview(); drawReviewMarkers(); map.closePopup(); }
+function reubicarGrupoDesdeMapa(groupKey){ pickingId = 'GROUP:' + groupKey; pickingBanner.style.display = 'block'; map.closePopup(); }
+function eliminarGrupoDesdeMapa(groupKey){
+  if (!confirm('¿Eliminar este/estos pedido(s) de la ruta?')) return;
+  points = points.filter(p => groupKeyFor(p) !== groupKey);
+  renderReview(); drawReviewMarkers(); map.closePopup();
+}
 
 // ================= Mapa =================
 function createMapIfNeeded(){
@@ -501,6 +746,27 @@ function createMapIfNeeded(){
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19 }).addTo(map);
     map.on('click', e => {
       if (!pickingId) return;
+      if (pickingId === '__start__'){
+        startPoint = { lat: e.latlng.lat, lon: e.latlng.lng };
+        startResolvedFor = startAddrInput.value.trim();
+        pickingId = null; pickingBanner.style.display = 'none';
+        drawEndpointMarkers(); renderEndpointIssues(false, !endPoint && endAddrInput.value.trim() ? true : false);
+        return;
+      }
+      if (pickingId === '__end__'){
+        endPoint = { lat: e.latlng.lat, lon: e.latlng.lng };
+        endResolvedFor = endAddrInput.value.trim();
+        pickingId = null; pickingBanner.style.display = 'none';
+        drawEndpointMarkers(); renderEndpointIssues(!startPoint, false);
+        return;
+      }
+      if (pickingId.startsWith && pickingId.startsWith('GROUP:')){
+        const groupKey = pickingId.slice(6);
+        points.filter(p => groupKeyFor(p) === groupKey).forEach(p => { p.lat = e.latlng.lat; p.lon = e.latlng.lng; p.status = 'ok'; });
+        pickingId = null; pickingBanner.style.display = 'none';
+        renderReview(); drawReviewMarkers();
+        return;
+      }
       const p = points.find(x => x.id === pickingId);
       p.lat = e.latlng.lat; p.lon = e.latlng.lng; p.status = 'ok';
       pickingId = null; pickingBanner.style.display = 'none';
@@ -515,19 +781,22 @@ function pinIcon(bg, fg, label, square){
 let endpointLayers = [];
 function drawEndpointMarkers(){
   endpointLayers.forEach(l => map.removeLayer(l)); endpointLayers = [];
-  if (startPoint) endpointLayers.push(L.marker([startPoint.lat, startPoint.lon], { icon: pinIcon('#5ab0ff','#0c2032','S',true) }).addTo(map).bindPopup('Salida'));
-  if (endPoint) endpointLayers.push(L.marker([endPoint.lat, endPoint.lon], { icon: pinIcon('#5ab0ff','#0c2032','F',true) }).addTo(map).bindPopup('Llegada'));
+  if (startPoint) endpointLayers.push(L.marker([startPoint.lat, startPoint.lon], { icon: pinIcon('#5ab0ff','#0c2032', isDistricompAddress(startAddrInput.value.trim())?'D':'S', true) }).addTo(map).bindPopup(labelFor(startAddrInput.value.trim(),'Salida')));
+  if (endPoint) endpointLayers.push(L.marker([endPoint.lat, endPoint.lon], { icon: pinIcon('#5ab0ff','#0c2032', isDistricompAddress(endAddrInput.value.trim())?'D':'F', true) }).addTo(map).bindPopup(labelFor(endAddrInput.value.trim(),'Llegada')));
 }
 function drawReviewMarkers(){
   layers.review.forEach(l => map.removeLayer(l)); layers.review = [];
-  points.filter(p => p.status === 'ok').forEach(p => {
+  const groups = buildGroupedStops(points.filter(p => p.status === 'ok'));
+  groups.forEach(g => {
     const icon = L.divIcon({ className:'', html:`<div style="background:#f2994a;width:14px;height:14px;border-radius:50%;border:2px solid #12161c;"></div>`, iconSize:[14,14], iconAnchor:[7,7] });
-    const popupHtml = `<div style="font-size:12px;"><b>${p.name || ''}</b><br>${p.address}
-      <div style="display:flex;gap:6px;margin-top:6px;">
-        <button class="btn-mini" onclick="reubicarDesdeMapa('${p.id}')">Reubicar</button>
-        <button class="btn-mini" onclick="eliminarDesdeMapa('${p.id}')">Eliminar</button>
+    let popupHtml = `<div style="font-size:12px;"><b>${g.name || ''}</b><br>${g.address}`;
+    if (g.count > 1) popupHtml += `<br><b>${g.count} pedidos en esta dirección</b>`;
+    if (g.hasTurnoMismatch) popupHtml += `<br><span style="color:#e0605c;">⚠ Turno distinto: ${g.mismatchTurnos.join(', ')}</span>`;
+    popupHtml += `<div style="display:flex;gap:6px;margin-top:6px;">
+        <button class="btn-mini" onclick="reubicarGrupoDesdeMapa('${g.groupKey}')">Reubicar</button>
+        <button class="btn-mini" onclick="eliminarGrupoDesdeMapa('${g.groupKey}')">Eliminar</button>
       </div></div>`;
-    const m = L.marker([p.lat, p.lon], { icon }).addTo(map).bindPopup(popupHtml);
+    const m = L.marker([g.lat, g.lon], { icon }).addTo(map).bindPopup(popupHtml);
     layers.review.push(m);
   });
 }
@@ -535,6 +804,14 @@ function drawReviewMarkers(){
 // ================= Confirmación previa =================
 calcBtn.addEventListener('click', () => {
   if (calcBtn.textContent.includes('Confirmar')) return;
+  if (!vehicleNameInput.value.trim()){
+    vehicleNameInput.focus();
+    vehicleNameInput.style.borderColor = 'var(--err)';
+    calcStatus.className = 'status err';
+    calcStatus.textContent = 'Ingresá el nombre del móvil / repartidor antes de calcular la ruta.';
+    return;
+  }
+  vehicleNameInput.style.borderColor = '';
   renderConfirmation();
 });
 function renderConfirmation(){
@@ -581,10 +858,10 @@ async function tripFor(group){
   if (data.code !== 'Ok') throw new Error('El motor de rutas no pudo resolver el recorrido.');
   const waypoints = data.waypoints;
   const orderedIdx = waypoints.map((wp,i) => ({ i, order: wp.waypoint_index })).sort((a,b) => a.order-b.order).map(o => o.i);
-  const all = [{ ...startPoint, address: startAddrInput.value.trim(), name: 'SALIDA', isEndpoint: true }, ...group,
-               ...(roundtrip ? [] : [{ ...endPoint, address: endAddrInput.value.trim(), name: 'LLEGADA', isEndpoint: true }])];
+  const all = [{ ...startPoint, address: startAddrInput.value.trim(), name: labelFor(startAddrInput.value.trim(),'SALIDA'), isEndpoint: true }, ...group,
+               ...(roundtrip ? [] : [{ ...endPoint, address: endAddrInput.value.trim(), name: labelFor(endAddrInput.value.trim(),'LLEGADA'), isEndpoint: true }])];
   let orderedStops = orderedIdx.map(i => all[i]);
-  if (roundtrip) orderedStops = orderedStops.concat([{ ...startPoint, address: startAddrInput.value.trim(), name: 'REGRESO A SALIDA', isEndpoint: true }]);
+  if (roundtrip) orderedStops = orderedStops.concat([{ ...startPoint, address: startAddrInput.value.trim(), name: isDistricompAddress(startAddrInput.value.trim()) ? 'DISTRICOMP (regreso)' : 'REGRESO A SALIDA', isEndpoint: true }]);
   const trip = data.trips[0];
   return { stops: orderedStops, distance: trip.distance, duration: trip.duration, geometry: trip.geometry };
 }
@@ -593,16 +870,33 @@ async function runCalc(){
   calcBtn.disabled = true; calcStatus.className = 'status'; calcStatus.textContent = 'Calculando ruta(s)...';
   results = {};
   try{
-    startPoint = await geocodeOne(startAddrInput.value.trim());
-    endPoint = endAddrInput.value.trim() ? await geocodeOne(endAddrInput.value.trim()) : null;
+    const startTxt = startAddrInput.value.trim();
+    const endTxt = endAddrInput.value.trim();
+    if (!startPoint || startResolvedFor !== startTxt){
+      try{ startPoint = await geocodeOne(startTxt); startResolvedFor = startTxt; }
+      catch(e){
+        renderEndpointIssues(true, false);
+        throw new Error('No se pudo ubicar el punto de salida. Usá el botón "Elegir en el mapa" que apareció más abajo, o revisá la dirección.');
+      }
+    }
+    if (endTxt){
+      if (!endPoint || endResolvedFor !== endTxt){
+        try{ endPoint = await geocodeOne(endTxt); endResolvedFor = endTxt; }
+        catch(e){
+          renderEndpointIssues(false, true);
+          throw new Error('No se pudo ubicar el punto de llegada. Usá el botón "Elegir en el mapa" que apareció más abajo, o revisá la dirección.');
+        }
+      }
+    } else { endPoint = null; endResolvedFor = null; }
     const usable = points.filter(p => p.status === 'ok');
     if (!usable.length) throw new Error('No hay direcciones ubicadas para calcular la ruta.');
+    const groups = buildGroupedStops(usable);
     if (hasTurnoSplit){
-      const manana = usable.filter(p => p.turno === 'manana');
-      const tarde = usable.filter(p => p.turno === 'tarde');
+      const manana = groups.filter(g => g.turno === 'manana');
+      const tarde = groups.filter(g => g.turno === 'tarde');
       if (manana.length) results.manana = await tripFor(manana);
       if (tarde.length) results.tarde = await tripFor(tarde);
-    } else { results.manana = await tripFor(usable); }
+    } else { results.manana = await tripFor(groups); }
     calcStatus.className = 'status ok'; calcStatus.textContent = 'Ruta calculada correctamente.';
     downloadRow.style.display = 'flex'; saveHistBtn.style.display = 'block';
     buildTabs();
@@ -639,9 +933,17 @@ function renderStops(trip, key){
   stopsList.appendChild(summary);
   trip.stops.forEach((s, idx) => {
     const div = document.createElement('div'); div.className = 'stop' + (s.isEndpoint ? ' depot' : '');
-    div.innerHTML = `<div class="badge">${s.isEndpoint ? '🏠' : idx}</div><div class="addr"><div class="name">${s.isEndpoint ? s.name : (s.name || 'Parada ' + idx)}</div><div class="dist">${s.address}</div></div>`;
+    const countBadge = (!s.isEndpoint && s.count > 1) ? ` <span class="qty-badge">×${s.count} pedidos</span>` : '';
+    const warnBadge = (!s.isEndpoint && s.hasTurnoMismatch) ? ` <span class="warn-badge" title="Hay pedido(s) de este cliente con otro turno: ${s.mismatchTurnos.join(', ')}">⚠</span>` : '';
+    const delBtn = s.isEndpoint ? '' : `<button class="stop-del" title="Eliminar este pedido" onclick="removeStopAndRecalc('${s.groupKey}')">✕</button>`;
+    div.innerHTML = `<div class="badge">${s.isEndpoint ? '🏠' : idx}</div><div class="addr"><div class="name">${s.isEndpoint ? s.name : (s.name || 'Parada ' + idx)}${countBadge}${warnBadge}</div><div class="dist">${s.address}</div></div>${delBtn}`;
     stopsList.appendChild(div);
   });
+}
+async function removeStopAndRecalc(groupKey){
+  if (!confirm('¿Eliminar este pedido (todos los de esta dirección) de la ruta y recalcular?')) return;
+  points = points.filter(p => groupKeyFor(p) !== groupKey);
+  await runCalc();
 }
 function renderRouteMap(trip, key){
   if (!trip) return;
@@ -655,7 +957,10 @@ function renderRouteMap(trip, key){
   trip.stops.forEach((s, idx) => {
     const icon = s.isEndpoint ? pinIcon('#5ab0ff','#0c2032', s.name[0], true) : pinIcon(color, '#1a1206', idx, false);
     const marker = L.marker([s.lat, s.lon], { icon }).addTo(map);
-    marker.bindPopup(`<b>${s.isEndpoint ? s.name : (s.name || 'Parada ' + idx)}</b><br>${s.address}`);
+    let popup = `<b>${s.isEndpoint ? s.name : (s.name || 'Parada ' + idx)}</b><br>${s.address}`;
+    if (!s.isEndpoint && s.count > 1) popup += `<br><b>${s.count} pedidos en esta dirección</b>`;
+    if (!s.isEndpoint && s.hasTurnoMismatch) popup += `<br><span style="color:#e0605c;">⚠ Algún pedido tiene otro turno: ${s.mismatchTurnos.join(', ')}</span>`;
+    marker.bindPopup(popup);
     markers.push(marker);
   });
   layers[key] = markers;
@@ -665,7 +970,14 @@ function exportExcel(){
   const wb = XLSX.utils.book_new();
   Object.keys(results).forEach(key => {
     const trip = results[key]; if (!trip) return;
-    const data = trip.stops.map((s, idx) => ({ Orden: s.isEndpoint ? '-' : idx, Parada: s.isEndpoint ? s.name : (s.name || ''), Direccion: s.address, Lat: s.lat, Lon: s.lon }));
+    const data = trip.stops.map((s, idx) => ({
+      Orden: s.isEndpoint ? '-' : idx,
+      Parada: s.isEndpoint ? s.name : (s.name || ''),
+      Direccion: s.address,
+      Pedidos: s.isEndpoint ? '' : (s.count || 1),
+      Bultos: '',
+      Lat: s.lat, Lon: s.lon
+    }));
     const ws = XLSX.utils.json_to_sheet(data);
     XLSX.utils.book_append_sheet(wb, ws, key === 'tarde' ? 'Tarde' : 'Mañana');
   });
@@ -678,7 +990,12 @@ function exportList(){
     const trip = results[key]; if (!trip) return;
     txt += `\n=== ${key === 'tarde' ? 'TURNO TARDE (14-18)' : 'TURNO MAÑANA (9-13)'} ===\n`;
     txt += `${(trip.distance/1000).toFixed(1)} km · ${Math.round(trip.duration/60)} min\n\n`;
-    trip.stops.forEach((s, idx) => { txt += s.isEndpoint ? `  ${s.name}: ${s.address}\n` : `  ${idx}. ${s.name || 'Parada ' + idx} — ${s.address}\n`; });
+    trip.stops.forEach((s, idx) => {
+      if (s.isEndpoint){ txt += `  ${s.name}: ${s.address}\n`; return; }
+      const qty = s.count > 1 ? ` (${s.count} pedidos)` : '';
+      txt += `  ${idx}. ${s.name || 'Parada ' + idx}${qty} — ${s.address}\n`;
+      txt += `     Bultos recibidos: ______\n`;
+    });
   });
   const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'ruta_optima.txt'; a.click();
