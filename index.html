@@ -60,14 +60,20 @@
   .row-btns button{ flex:1; }
   .stops{ flex:1; padding:16px 0 24px; }
   .stops h2{ padding:0 22px; }
-  .stop{ display:flex; gap:12px; padding:10px 22px; border-bottom:1px solid var(--line); }
+  .stop{ display:flex; gap:12px; padding:10px 22px; border-bottom:1px solid var(--line); align-items:center; }
   .stop .badge{ font-family:'IBM Plex Mono', monospace; font-weight:600; font-size:12px; width:24px; height:24px; border-radius:6px; background:var(--surface-2); border:1px solid var(--line); display:flex; align-items:center; justify-content:center; flex-shrink:0; color:var(--accent); }
   .stop.depot .badge{ background:var(--depot); color:#0c2032; border-color:var(--depot); }
-  .stop .addr{ font-size:12.8px; line-height:1.4; }
+  .stop .addr{ font-size:12.8px; line-height:1.4; flex:1; min-width:0; }
   .stop .addr .name{ font-weight:600; }
   .stop .addr .dist{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--muted); margin-top:2px; }
   .stop-del{ width:auto; flex-shrink:0; padding:4px 9px; font-size:13px; border-radius:6px; background:transparent; border:1px solid var(--line); color:var(--err); align-self:center; }
   .stop-del:hover{ background:rgba(224,96,92,.15); border-color:var(--err); }
+  .drag-handle{ flex-shrink:0; width:26px; height:34px; display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:grab; touch-action:none; font-size:16px; letter-spacing:-2px; border-radius:6px; }
+  .drag-handle:hover{ color:var(--accent); background:var(--surface-2); }
+  .stop.dragging{ opacity:.55; background:var(--surface-2); }
+  .stop-placeholder{ border:1.5px dashed var(--accent); border-radius:8px; margin:4px 22px; height:44px; background:rgba(242,153,74,.06); }
+  .manual-order-banner{ background:rgba(242,153,74,.12); border:1px solid var(--accent); border-radius:8px; padding:10px 12px; margin:0 22px 12px; }
+  .manual-order-banner .txt{ font-size:12px; color:var(--text); margin-bottom:8px; }
   .qty-badge{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--accent); font-weight:600; }
   .warn-badge{ color:var(--err); cursor:help; }
   .tabs{ display:flex; gap:6px; padding:0 22px 14px; }
@@ -931,17 +937,98 @@ function renderStops(trip, key){
   summary.style.cssText = "padding:4px 22px 14px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--muted);";
   summary.textContent = `${key === 'tarde' ? 'Turno tarde' : 'Turno mañana'} · ${km} km · ${mins} min · ${deliveries} paradas`;
   stopsList.appendChild(summary);
+
+  if (trip.manuallyOrdered){
+    const banner = document.createElement('div');
+    banner.className = 'manual-order-banner';
+    banner.innerHTML = `<div class="txt">Cambiaste el orden a mano. El km/tiempo y el trazado del mapa de arriba todavía son los del orden anterior.</div>
+      <button class="btn-primary" onclick="recalcWithManualOrder('${key}')">Recalcular ruta respetando este orden</button>`;
+    stopsList.appendChild(banner);
+  }
+
   trip.stops.forEach((s, idx) => {
     const div = document.createElement('div'); div.className = 'stop' + (s.isEndpoint ? ' depot' : '');
+    div.dataset.turnokey = key;
+    if (!s.isEndpoint) div.dataset.groupkey = s.groupKey;
     const countBadge = (!s.isEndpoint && s.count > 1) ? ` <span class="qty-badge">×${s.count} pedidos</span>` : '';
     const warnBadge = (!s.isEndpoint && s.hasTurnoMismatch) ? ` <span class="warn-badge" title="Hay pedido(s) de este cliente con otro turno: ${s.mismatchTurnos.join(', ')}">⚠</span>` : '';
+    const handle = s.isEndpoint ? '' : `<div class="drag-handle" title="Arrastrar para reordenar">⠿</div>`;
     const delBtn = s.isEndpoint ? '' : `<button class="stop-del" title="Eliminar este pedido" onclick="removeStopAndRecalc('${s.groupKey}')">✕</button>`;
-    div.innerHTML = `<div class="badge">${s.isEndpoint ? '🏠' : idx}</div><div class="addr"><div class="name">${s.isEndpoint ? s.name : (s.name || 'Parada ' + idx)}${countBadge}${warnBadge}</div><div class="dist">${s.address}</div></div>${delBtn}`;
+    div.innerHTML = `${handle}<div class="badge">${s.isEndpoint ? '🏠' : idx}</div><div class="addr"><div class="name">${s.isEndpoint ? s.name : (s.name || 'Parada ' + idx)}${countBadge}${warnBadge}</div><div class="dist">${s.address}</div></div>${delBtn}`;
     stopsList.appendChild(div);
+    if (!s.isEndpoint){
+      div.querySelector('.drag-handle').addEventListener('pointerdown', onDragHandleDown);
+    }
   });
 }
+
+// ---- Arrastrar y soltar para reordenar (mouse y táctil) ----
+let dragCtx = null;
+function onDragHandleDown(e){
+  e.preventDefault();
+  const rowEl = e.currentTarget.closest('.stop');
+  dragCtx = { rowEl, key: rowEl.dataset.turnokey, pointerId: e.pointerId };
+  rowEl.classList.add('dragging');
+  e.currentTarget.setPointerCapture(e.pointerId);
+  document.addEventListener('pointermove', onDragMove);
+  document.addEventListener('pointerup', onDragUp, { once: true });
+}
+function onDragMove(e){
+  if (!dragCtx) return;
+  const { rowEl } = dragCtx;
+  const siblings = [...stopsList.querySelectorAll('.stop:not(.depot)')].filter(el => el !== rowEl);
+  const y = e.clientY;
+  for (const sib of siblings){
+    const rect = sib.getBoundingClientRect();
+    const midpoint = rect.top + rect.height / 2;
+    if (y < midpoint){
+      if (sib.previousElementSibling !== rowEl) stopsList.insertBefore(rowEl, sib);
+      break;
+    } else if (sib === siblings[siblings.length - 1]){
+      if (sib.nextElementSibling !== rowEl) stopsList.insertBefore(rowEl, sib.nextElementSibling);
+    }
+  }
+}
+function onDragUp(e){
+  if (!dragCtx) return;
+  const { rowEl, key } = dragCtx;
+  rowEl.classList.remove('dragging');
+  document.removeEventListener('pointermove', onDragMove);
+  dragCtx = null;
+  finalizeManualOrder(key);
+}
+function finalizeManualOrder(key){
+  const trip = results[key]; if (!trip) return;
+  const middleGroupKeys = [...stopsList.querySelectorAll('.stop:not(.depot)')].map(el => el.dataset.groupkey);
+  const middleStops = middleGroupKeys.map(gk => trip.stops.find(s => s.groupKey === gk)).filter(Boolean);
+  const first = trip.stops[0];
+  const last = trip.stops[trip.stops.length - 1];
+  trip.stops = (first === last) ? [first, ...middleStops] : [first, ...middleStops, last];
+  trip.manuallyOrdered = true;
+  renderStops(trip, key);
+  renderRouteMap(trip, key);
+}
+async function recalcWithManualOrder(key){
+  const trip = results[key]; if (!trip) return;
+  calcStatus.className = 'status'; calcStatus.textContent = 'Recalculando distancia y tiempo con el orden manual...';
+  try{
+    const coords = trip.stops.map(s => s.lon + ',' + s.lat).join(';');
+    const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.code !== 'Ok' || !data.routes || !data.routes.length) throw new Error('No se pudo recalcular la ruta con ese orden.');
+    const route = data.routes[0];
+    trip.distance = route.distance; trip.duration = route.duration; trip.geometry = route.geometry;
+    trip.manuallyOrdered = false;
+    calcStatus.className = 'status ok'; calcStatus.textContent = 'Ruta actualizada respetando el orden manual.';
+    renderStops(trip, key);
+    renderRouteMap(trip, key);
+  }catch(err){
+    calcStatus.className = 'status err'; calcStatus.textContent = 'Error: ' + err.message;
+  }
+}
 async function removeStopAndRecalc(groupKey){
-  if (!confirm('¿Eliminar este pedido (todos los de esta dirección) de la ruta y recalcular?')) return;
+  if (!confirm('¿Eliminar este pedido (todos los de esta dirección) de la ruta y recalcular? (esto vuelve a optimizar el orden desde cero)')) return;
   points = points.filter(p => groupKeyFor(p) !== groupKey);
   await runCalc();
 }
